@@ -21,7 +21,7 @@ Comandi per installare le librerie python necessarie:
  
  
 1. Conversione della Chiave 
-Convertire la chiave esadecimale (64 caratteri) in un fi le binario utilizzando lo script 
+Convertire la chiave esadecimale (64 caratteri) in un file binario utilizzando lo script 
 HexToCrypt15Key.java. 
 Compilare il fi le Java e avviare la conversione della chiave.  
 •  Eseguire i seguenti comandi: 
@@ -40,7 +40,7 @@ o  python wadecrypt.py [percorso della chiave key] [percorso del database cifrat
 o  Es. python wadecrypt.py “C:\key” “C:\user\desktop\msgstore.db.crypt15” 
 •  Output: msgstore.db (fi le SQLite decifrato) 
  
-3. Verifi ca e Analisi del Database Decifrato  
+3. Verifica e Analisi del Database Decifrato  
 Una volta ottenuto il fi le msgstore.db: 
 •  Eseguire lo script python con il seguente comando: 
 o  python wa_forensic.py --db-path [percorso del database decriptato]  
