@@ -246,7 +246,7 @@ def get_ephemeral_chats():
         
         results.append(
             f"{'GRUPPO: ' + group_name + ' | ' if group_name else 'NUMERO: ' + phone_number + ' | '}"
-            f"{'TIMER ELIMINAZIONE: ' + expiration_str + ' giorno' if expiration == 1 else ' giorni'}"
+            f"{'TIMER ELIMINAZIONE: ' + expiration_str + ' giorno' if expiration == 1 else 'TIMER ELIMINAZIONE: ' + expiration_str + ' giorni'}"
         )
     
         """ results.append(
