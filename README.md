@@ -23,25 +23,25 @@ Comandi per installare le librerie python necessarie:
 1. Conversione della Chiave 
 Convertire la chiave esadecimale (64 caratteri) in un file binario utilizzando lo script 
 HexToCrypt15Key.java. 
-Compilare il fi le Java e avviare la conversione della chiave.  
+Compilare il file Java e avviare la conversione della chiave.  
 •  Eseguire i seguenti comandi: 
 o  javac HexToCrypt15Key.java 
 o  java HexToCrypt15Key [chiave_esadecimale] 
-•  Verrà generato un fi le binario utilizzabile con lo strumento di decifrazione. 
+•  Verrà generato un file binario utilizzabile con lo strumento di decifrazione. 
 •  Nota: Sostituire [chiave_esadecimale] con la chiave reale a 64 cifre. 
  
 2. Decifrazione del Database Utilizzare lo strumento wadecrypt per decifrare il database .crypt15. 
 •  Input richiesti: 
-o  key (fi le binario generato  con HexToCrypt15Key) 
-o  msgstore.db.crypt15 (fi le cifrato) 
+o  key (file binario generato con HexToCrypt15Key) 
+o  msgstore.db.crypt15 (file cifrato) 
 •  Eseguire il seguente comando dalla cartella .\wa-crypt-tools-main\wa-crypt-
 tools-main\src\wa_crypt_tools: 
 o  python wadecrypt.py [percorso della chiave key] [percorso del database cifrato] 
 o  Es. python wadecrypt.py “C:\key” “C:\user\desktop\msgstore.db.crypt15” 
-•  Output: msgstore.db (fi le SQLite decifrato) 
+•  Output: msgstore.db (file SQLite decifrato) 
  
 3. Verifica e Analisi del Database Decifrato  
-Una volta ottenuto il fi le msgstore.db: 
+Una volta ottenuto il file msgstore.db: 
 •  Eseguire lo script python con il seguente comando: 
 o  python wa_forensic.py --db-path [percorso del database decriptato]  
-o  Es.  python wa_forensic.py --db-path “C:\user\desktop\msgstore.db” 
+o  Es. python wa_forensic.py --db-path “C:\user\desktop\msgstore.db” 
