@@ -1,7 +1,7 @@
 # Whatsapp_Forensic
 Guida alla Decifrazione e Analisi del Database .crypt15 
 Questa guida descrive il processo per decifrare un database cifrato (msgstore.db.crypt15) 
-utilizzando una chiave a 64 cifre in formato esadecimale. È pensata per uso forense o per il recupero di dati con fi nalità lecite. 
+utilizzando una chiave a 64 cifre in formato esadecimale. È pensata per uso forense e per l'interrogazione di dati con finalità lecite.
  
 Strumenti necessari:  
 •  java (testato con java 21.0.3 2024-04-16 LTS) 
