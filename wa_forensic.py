@@ -1,1117 +1,877 @@
-import sqlite3, datetime, os, webbrowser, folium, re, warnings, argparse
+import sqlite3
+import os
+import webbrowser
+import re
+import warnings
+import io
+import base64
+from datetime import datetime, timedelta
+
+# Import per la GUI
+from tkinter import Tk, Frame, Label, Menu, messagebox, Toplevel, Listbox, Scrollbar, Text, BooleanVar
+from tkinter import ttk
+from tkinter.filedialog import askopenfilename, asksaveasfilename
+from tkinter.simpledialog import askinteger
+from tkinter import PhotoImage
+
+# Import per l'analisi e il plotting
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import pandas as pd
 import numpy as np
-import matplotlib.dates as mdates
 from collections import Counter
 from wordcloud import WordCloud
-from tkinter import Tk, Frame, Label
-from tkinter import ttk, Toplevel, Listbox, Scrollbar
+import folium
 from textblob import TextBlob
-from datetime import datetime
-from datetime import timedelta
 
+# Import per il report PDF
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
+from reportlab.lib import colors
+
+# Import per il clustering (opzionali)
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.cluster import KMeans, AgglomerativeClustering
+    from sklearn.decomposition import PCA
+    from scipy.cluster.hierarchy import dendrogram, linkage
+    import nltk
+    CLUSTERING_ENABLED = True
+except ImportError:
+    CLUSTERING_ENABLED = False
+
+# Ignora avvisi non critici
 warnings.filterwarnings("ignore", category=UserWarning)
-
-parser = argparse.ArgumentParser(description='Strumento di analisi forense per database whatsapp android')
-parser.add_argument('--db-path', required=True, help='Percorso del database SQLite da analizzare')
-args = parser.parse_args()
-db_path = args.db_path
-
-
-# FUNZIONI BASE
-
-# Funzione per connettersi al database (rimane invariata)
-def connect_db():
-    try:
-        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error as e:
-        print(f"Errore durante la connessione al database: {e}")
-        return None
-
-
-# Funzione per eseguire query SQL (rimane invariata)
-def fetch_data(query, params=None):
-    conn = connect_db()
-    if conn is None:
-        return []
-    cursor = conn.cursor()
-    try:
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-        data = cursor.fetchall()
-    except sqlite3.Error as e:
-        print(f"Errore durante l'esecuzione della query: {e}")
-        data = []
-    finally:
-        conn.close()
-    return data
-
-
-# Funzione per visualizzare il grafico all'interno della GUI
-def show_plot(plot_func):
-    plt.close('all')  # Chiude tutte le figure precedenti
-    fig = plt.figure(figsize=(8, 6))  # Crea UNA figura
-    try:
-        plot_func(fig)  # Passa la figura alla funzione
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        plt.close()
-        print(f"Errore durante il plotting: {str(e)}")
-
-
-# SEZIONE ANALISI CHAT
-
-# Funzione per ottenere le chat più attive con il numero di telefono o nome del gruppo
-def get_active_chats():
-    query = """
-        SELECT 
-            CASE 
-                WHEN chat.subject IS NOT NULL THEN chat.subject 
-                ELSE jid.user 
-            END AS chat_identifier, 
-            COUNT(message._id) AS message_count
-        FROM chat
-        JOIN jid ON chat.jid_row_id = jid._id
-        JOIN message ON chat._id = message.chat_row_id
-        GROUP BY chat_identifier
-        ORDER BY message_count DESC
-        LIMIT 10;
-    """
-    data = fetch_data(query)
-    chat_identifiers, message_counts = zip(*data) if data else ([], [])
-    return chat_identifiers, message_counts
-
-# Funzione per visualizzare le chat più attive
-def plot_active_chats():
-    def plot(fig):
-        chat_ids, message_counts = get_active_chats()
-        
-        if not chat_ids:
-            plt.title("Nessuna chat attiva trovata")
-            return
-            
-        plt.barh(chat_ids, message_counts, color='lightcoral')
-        plt.xlabel("Numero di messaggi")
-        plt.ylabel("Chat")
-        plt.title("Top 10 chat più attive")
-    
-    plt.close('all')
-    fig = plt.figure(figsize=(10, 5))
-    plot(fig)
-    plt.tight_layout()
-    plt.show()
-
-
-# Funzione per ottenere le 20 chat più recenti
-def get_recent_chats(limit=20):
-    query = """
-        SELECT 
-            CASE 
-                WHEN chat.subject IS NOT NULL THEN chat.subject 
-                ELSE jid.user 
-            END AS chat_identifier,
-            MAX(message.timestamp) AS last_activity
-        FROM chat
-        JOIN jid ON chat.jid_row_id = jid._id
-        JOIN message ON chat._id = message.chat_row_id
-        GROUP BY chat_identifier
-        ORDER BY last_activity DESC
-        LIMIT ?;
-    """
-    data = fetch_data(query, (limit,))
-    return [row[0] for row in data] if data else []
-
-# Funzione per visualizzare le chat recenti
-def show_recent_chats():
-    chats = get_recent_chats()
-    
-    top = Toplevel()
-    top.title("Ultime 10 chat attive")
-    top.geometry("600x400")
-    
-    frame = Frame(top)
-    frame.pack(fill="both", expand=True, padx=10, pady=10)
-    
-    Label(frame, text="Chat più recenti (per ultima attività):", font=('Arial', 10, 'bold')).pack(pady=5)
-    
-    listbox = Listbox(frame, width=80, height=15, font=('Consolas', 9))
-    scrollbar = Scrollbar(frame, orient="vertical", command=listbox.yview)
-    listbox.config(yscrollcommand=scrollbar.set)
-    
-    for i, chat in enumerate(chats, 1):
-        listbox.insert("end", f"{i}. {chat}")
-    
-    listbox.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-    
-# Funzione per ottenere i messaggi cancellati (senza testo)
-def get_deleted_messages():
-    query = """
-        SELECT 
-            CASE
-                WHEN chat.subject IS NOT NULL 
-                THEN sender_jid.user
-                ELSE chat_jid.user
-            END AS phone_number,  
-            chat.subject AS group_name,
-            message.timestamp AS message_timestamp,
-            message_revoked.revoke_timestamp AS revoked_timestamp,
-            message.from_me AS from_me
-        FROM message_revoked
-        INNER JOIN message 
-            ON message._id = message_revoked.message_row_id
-        INNER JOIN chat 
-            ON message.chat_row_id = chat._id
-        INNER JOIN jid AS chat_jid 
-            ON chat.jid_row_id = chat_jid._id
-        LEFT JOIN jid AS sender_jid 
-            ON message.sender_jid_row_id = sender_jid._id
-        ORDER BY message_timestamp DESC;
-    """
-    data = fetch_data(query)
-    
-    results = []
-    for row in data:
-        phone_number, group_name, message_timestamp, revoked_timestamp, from_me = row
-        
-        # Formattazione timestamp
-        if isinstance(message_timestamp, (int, float)) and message_timestamp > 0:
-            message_timestamp = datetime.fromtimestamp(message_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            message_timestamp = "Data non disponibile"
-        if isinstance(revoked_timestamp, (int, float)) and revoked_timestamp > 0:
-            revoked_timestamp = datetime.fromtimestamp(revoked_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            revoked_timestamp = "Data non disponibile"
-            
-        if from_me:
-            results.append(
-                f"DA: Questo numero | A: {phone_number} | "
-                f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                f"DATA INVIO: {message_timestamp} | "
-                f"DATA ELIMINAZIONE: {revoked_timestamp}"
-            )
-        else:
-            results.append(
-                f"DA: {phone_number} | A: Questo numero | "
-                f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                f"DATA INVIO: {message_timestamp} | "
-                f"DATA ELIMINAZIONE: {revoked_timestamp}"
-            )
-    
-    return results
-    
-def show_deleted_messages():
-    results = get_deleted_messages()
-    
-    top = Toplevel()
-    top.title(f"Messaggi cancellati")
-    top.protocol("WM_DELETE_WINDOW", top.destroy)  # Chiude correttamente la finestra
-    
-    listbox = Listbox(top, width=120, height=20, font=('Consolas', 8))
-    scrollbar = Scrollbar(top, orient="vertical", command=listbox.yview)
-    listbox.config(yscrollcommand=scrollbar.set)
-    
-    for result in results:
-        listbox.insert("end", result)
-    
-    listbox.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-
-
-# Funzione per ottenere le chat con messaggi effimeri attivi
-def get_ephemeral_chats():
-    query = """
-        SELECT
-            chat_jid.user AS phone_number,
-            chat.subject AS group_name,
-            chat.ephemeral_expiration AS expiration
-        FROM chat
-        INNER JOIN jid AS chat_jid ON chat.jid_row_id = chat_jid._id
-        WHERE expiration > 0
-    """
-    data = fetch_data(query)
-    
-    results = []
-    for row in data:
-        phone_number, group_name, expiration = row
-        
-        # Formattazione timestamp
-        expiration = expiration / 60 / 60 / 24
-        expiration_str = str(int(expiration))
-        
-        results.append(
-            f"{'GRUPPO: ' + group_name + ' | ' if group_name else 'NUMERO: ' + phone_number + ' | '}"
-            f"{'TIMER ELIMINAZIONE: ' + expiration_str + ' giorno' if expiration == 1 else 'TIMER ELIMINAZIONE: ' + expiration_str + ' giorni'}"
-        )
-    
-        """ results.append(
-            {phone_number, group_name, expiration}
-        ) """
-    return results
-    
-def show_ephemeral_chats():
-    results = get_ephemeral_chats()
-    
-    top = Toplevel()
-    top.title(f"Chat Effimere")
-    top.protocol("WM_DELETE_WINDOW", top.destroy)  # Chiude correttamente la finestra
-    
-    listbox = Listbox(top, width=120, height=20, font=('Consolas', 8))
-    scrollbar = Scrollbar(top, orient="vertical", command=listbox.yview)
-    listbox.config(yscrollcommand=scrollbar.set)
-    
-    for result in results:
-        listbox.insert("end", result)
-    
-    listbox.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-
-
-# SEZIONE ANALISI TESTUALE
-
-# Funzione per ottenere le parole più usate (top 20)
-def get_most_common_words():
-    query = """
-        SELECT message._id, message.text_data
-        FROM message
-        WHERE message.text_data IS NOT NULL;
-    """
-    data = fetch_data(query)
-    words = " ".join(row[1] for row in data).split()
-    word_counts = Counter(words).most_common(20)
-    words, counts = zip(*word_counts) if word_counts else ([], [])
-    return words, counts
-
-# Funzione per visualizzare l'istogramma delle parole più usate
-def plot_word_histogram():
-    def plot(plot):
-        words, counts = get_most_common_words()
-        plt.barh(words, counts, color='skyblue')
-        plt.xlabel("Frequenza")
-        plt.ylabel("Parola")
-        plt.title("Top 20 parole più utilizzate")
-    show_plot(plot)
-
-
-# Funzione per ottenere le parole più usate con almeno 4 lettere
-def get_most_common_words_min_4_letters():
-    query = """
-        SELECT message._id, message.text_data
-        FROM message
-        WHERE message.text_data IS NOT NULL;
-    """
-    data = fetch_data(query)
-    words = " ".join(row[1] for row in data).split()
-    words = [word for word in words if len(word) >= 4]
-    word_counts = Counter(words).most_common(20)
-    words, counts = zip(*word_counts) if word_counts else ([], [])
-    return words, counts
-
-# Funzione per visualizzare l'istogramma delle parole più usate con almeno 4 lettere
-def plot_word_histogram_min_4():
-    def plot(plot):
-        words, counts = get_most_common_words_min_4_letters()
-        plt.barh(words, counts, color='lightgreen')
-        plt.xlabel("Frequenza")
-        plt.ylabel("Parola")
-        plt.title("Top 20 parole più utilizzate (minimo 4 lettere)")
-    show_plot(plot)
-
-
-# Funzione per generare la WordCloud
-def generate_wordcloud():
-    query = """
-        SELECT message._id, message.text_data
-        FROM message
-        WHERE message.text_data IS NOT NULL;
-    """
-    data = fetch_data(query)
-    text = " ".join(row[1] for row in data)
-    
-    # Elaborazione del testo per calcolare le frequenze
-    words = text.lower().split()
-    words = [word.strip('.,!?()[]{}"\'') for word in words]  # Rimuove punteggiatura
-    words = [word for word in words if len(word) >= 4]       # Filtra parole brevi
-    
-    word_counts = Counter(words)
-    
-    # Genera la WordCloud dalle frequenze
-    wordcloud = WordCloud(
-        width=800,
-        height=400,
-        background_color='white',
-        relative_scaling=0.6    # Controlla la gradazione delle dimensioni (0-1)
-    ).generate_from_frequencies(word_counts)
-    
-    return wordcloud
-
-# Funzione per visualizzare la WordCloud
-def plot_wordcloud():
-    wordcloud = generate_wordcloud()
-    plt.figure(figsize=(8, 6))
-    plt.imshow(wordcloud, interpolation='bilinear')
-    plt.axis("off")
-    plt.title("WordCloud delle parole più usate")
-    plt.show()
-
-
-# Funzione pulizia testo per sentiment
-def clean_text(text):
-    try:
-        if not text:
-            return ''
-        text = re.sub(r'[^\w\s]', '', text)
-        text = re.sub(r'\b\w{1,3}\b', '', text)
-        text = re.sub(r'[\U0001F600-\U0001F64F]', '', text)
-        return text.strip().lower()
-    except:
-        return ''
-
-# Funzione aggiuntiva per analisi sentiment (esempio)
-def plot_sentiment():
-    def plot(fig):
-        data = fetch_data("""
-            SELECT text_data 
-            FROM message 
-            WHERE 
-                message_type = 0 AND
-                LENGTH(TRIM(text_data)) > 3 AND
-                text_data NOT LIKE '%<omit%'
-        """)
-        
-        if not data:
-            plt.title("Nessun testo valido per l'analisi")
-            return
-        
-        sentiments = []
-        batch_size = 100  # Analizza in batch per migliorare le prestazioni
-        for i in range(0, len(data), batch_size):
-            batch = data[i:i+batch_size]
-            sentiments += [TextBlob(clean_text(row[0])).sentiment.polarity for row in batch]
-
-        ax = fig.add_subplot(111)
-        fig.set_size_inches(8, 4)
-        plt.hist(sentiments, bins=20, color='purple', alpha=0.7)
-        ax.set_title('Distribuzione Sentiment')
-        ax.set_xlabel('Polarità (-1 negativo ~ 1 positivo)')
-        ax.set_ylabel('Frequenza')
-    
-    show_plot(plot)
-
-
-# SEZIONE RICERCHE
-
-# Funzione per la ricerca messaggi per testo
-def search_word_in_messages(word):
-    query = """
-        SELECT 
-            msg.text_data,
-            msg.timestamp,
-            msg.from_me,
-            sender_jid.user AS sender_number,
-            receiver_jid.user AS receiver_number,
-            chat.subject AS group_name
-        FROM message AS msg
-        LEFT JOIN chat ON msg.chat_row_id = chat._id
-        LEFT JOIN jid AS sender_jid 
-            ON (CASE WHEN chat.subject IS NOT NULL 
-                    THEN msg.sender_jid_row_id 
-                    ELSE chat.jid_row_id END) = sender_jid._id
-        LEFT JOIN jid AS receiver_jid ON chat.jid_row_id = receiver_jid._id
-        WHERE msg.text_data LIKE ?
-        ORDER BY msg.timestamp DESC
-        LIMIT 100;
-    """
-    data = fetch_data(query, (f"%{word}%",))
-    
-    results = []
-    for row in data:
-        text_data, timestamp, from_me, sender_number, receiver_number, group_name = row
-        
-        # Formattazione timestamp
-        if isinstance(timestamp, (int, float)) and timestamp > 0:
-            timestamp = datetime.fromtimestamp(timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            timestamp = "Data non disponibile"
-
-        # Gestione numeri
-        sender_number = sender_number or "Numero sconosciuto"
-        receiver_number = receiver_number or "Numero sconosciuto"
-        
-        if group_name:  # Messaggio di gruppo
-            results.append(f"DA: {sender_number} A: {group_name} DATA: {timestamp} MESSAGGIO: {text_data}")
-        else:           # Messaggio privato
-            if from_me == 1:
-                results.append(f"DA: Questo numero A: {receiver_number} DATA: {timestamp} MESSAGGIO: {text_data}")
-            else:
-                results.append(f"DA: {sender_number} A: Questo numero DATA: {timestamp} MESSAGGIO: {text_data}")
-    
-    return results
-
-# Funzione per mostrare i risultati della ricerca del testo
-def show_search_results(word):
-    results = search_word_in_messages(word)
-    
-    top = Toplevel()
-    top.title(f"Risultati ricerca: '{word}'")
-    top.protocol("WM_DELETE_WINDOW", top.destroy)  # Chiude correttamente la finestra
-    
-    listbox = Listbox(top, width=120, height=20, font=('Consolas', 8))
-    scrollbar = Scrollbar(top, orient="vertical", command=listbox.yview)
-    listbox.config(yscrollcommand=scrollbar.set)
-    
-    for result in results:
-        listbox.insert("end", result)
-    
-    listbox.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-    
-
-# Funzione per la ricerca messaggi cancellati per numero
-def search_deleted_messages(number):
-    query = """
-        SELECT 
-            CASE
-                WHEN chat.subject IS NOT NULL 
-                THEN sender_jid.user
-                ELSE chat_jid.user
-            END AS phone_number,  
-            chat.subject AS group_name,
-            message.timestamp AS message_timestamp,
-            message_revoked.revoke_timestamp AS revoked_timestamp,
-            message.from_me AS from_me
-        FROM message_revoked
-        INNER JOIN message 
-            ON message._id = message_revoked.message_row_id
-        INNER JOIN chat 
-            ON message.chat_row_id = chat._id
-        INNER JOIN jid AS chat_jid 
-            ON chat.jid_row_id = chat_jid._id
-        LEFT JOIN jid AS sender_jid 
-            ON message.sender_jid_row_id = sender_jid._id
-        WHERE phone_number = ?
-        ORDER BY message_timestamp DESC;
-    """
-    data = fetch_data(query, (f"{number}",))
-    
-    results_cancellati = []
-    for row in data:
-        phone_number, group_name, message_timestamp, revoked_timestamp, from_me = row
-        
-        # Formattazione timestamp
-        if isinstance(message_timestamp, (int, float)) and message_timestamp > 0:
-            message_timestamp = datetime.fromtimestamp(message_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            message_timestamp = "Data non disponibile"
-        if isinstance(revoked_timestamp, (int, float)) and revoked_timestamp > 0:
-            revoked_timestamp = datetime.fromtimestamp(revoked_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            revoked_timestamp = "Data non disponibile"
-        
-        if from_me:
-            results_cancellati.append(
-                f"DA: Questo numero | A: {phone_number} | "
-                f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                f"DATA INVIO: {message_timestamp} | "
-                f"DATA ELIMINAZIONE: {revoked_timestamp}"
-            )
-        else:
-            results_cancellati.append(
-                f"DA: {phone_number} | A: Questo numero | "
-                f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                f"DATA INVIO: {message_timestamp} | "
-                f"DATA ELIMINAZIONE: {revoked_timestamp}"
-            )
-    
-    return results_cancellati
-
-# Funzione per mostrare i risultati della ricerca dei messaggi cancellati per numero
-def show_search_deleted(number):
-    results_cancellati = search_deleted_messages(number)
-    
-    top = Toplevel()
-    top.title(f"Risultati ricerca: '{number}'")
-    top.protocol("WM_DELETE_WINDOW", top.destroy)  # Chiude correttamente la finestra
-    
-    listbox = Listbox(top, width=120, height=20, font=('Consolas', 8))
-    scrollbar = Scrollbar(top, orient="vertical", command=listbox.yview)
-    listbox.config(yscrollcommand=scrollbar.set)
-    
-    for result in results_cancellati:
-        listbox.insert("end", result)
-    
-    listbox.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-
-
-# Funzione per la ricerca messaggi visualizzabili solo una volta
-def search_onetime_messages(number):
-    query = """
-        SELECT
-            CASE
-                WHEN chat.subject IS NOT NULL 
-                THEN sender_jid.user
-                ELSE chat_jid.user
-            END AS number,
-            chat.subject AS group_name,
-            message.received_timestamp AS message_timestamp, 
-            message.text_data AS text_data, 
-            message.message_type AS type,
-            message.from_me AS from_me
-        FROM message 
-        INNER JOIN chat ON message.chat_row_id = chat._id
-        INNER JOIN jid AS chat_jid ON chat.jid_row_id = chat_jid._id
-        LEFT JOIN jid AS sender_jid ON message.sender_jid_row_id = sender_jid._id
-        WHERE number = ? AND message.message_type IN (42, 43, 82)
-        ORDER BY message.received_timestamp DESC
-    """
-    data = fetch_data(query, (f"{number}",))
-    
-    results_onetime = []
-    for row in data:
-        number, group_name, message_timestamp, text_data, type, from_me = row
-
-        # Formattazione timestamp
-        if isinstance(message_timestamp, (int, float)) and message_timestamp > 0:
-            message_timestamp = datetime.fromtimestamp(message_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            message_timestamp = "Data non disponibile"
-        
-        if text_data:
-            if type == 42:
-                results_onetime.append(
-                    f"{'DA: Questo numero | A: ' + number + ' | ' if from_me else 'DA: ' + number + ' | A: Questo numero | '}"
-                    f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                    f"DATA INVIO: {message_timestamp} | DIDASCALIA: {text_data} | TIPO: IMMAGINE"
-                )
-            elif type == 43:
-                results_onetime.append(
-                    f"{'DA: Questo numero | A: ' + number + ' | ' if from_me else 'DA: ' + number + ' | A: Questo numero | '}"
-                    f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                    f"DATA INVIO: {message_timestamp} | DIDASCALIA: {text_data} | TIPO: VIDEO"
-                )
-            elif type == 82:
-                results_onetime.append(
-                    f"{'DA: Questo numero | A: ' + number + ' | ' if from_me else 'DA: ' + number + ' | A: Questo numero | '}"
-                    f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                    f"DATA INVIO: {message_timestamp} | DIDASCALIA: {text_data} | TIPO: AUDIO"
-                )
-        else:
-            if type == 42:
-                results_onetime.append(
-                    f"{'DA: Questo numero | A: ' + number + ' | ' if from_me else 'DA: ' + number + ' | A: Questo numero | '}"
-                    f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                    f"DATA INVIO: {message_timestamp} | TIPO: IMMAGINE"
-                )
-            elif type == 43:
-                results_onetime.append(
-                    f"{'DA: Questo numero | A: ' + number + ' | ' if from_me else 'DA: ' + number + ' | A: Questo numero | '}"
-                    f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                    f"DATA INVIO: {message_timestamp} | TIPO: VIDEO"
-                )
-            elif type == 82:
-                results_onetime.append(
-                    f"{'DA: Questo numero | A: ' + number + ' | ' if from_me else 'DA: ' + number + ' | A: Questo numero | '}"
-                    f"{'GRUPPO: ' + group_name + ' | ' if group_name else ''}"
-                    f"DATA INVIO: {message_timestamp} | TIPO: AUDIO"
-                )
-
-    return results_onetime
-
-# Funzione per mostrare i risultati della ricerca dei messaggi visualizzabili solo una volta
-def show_search_onetime(number):
-    results_onetime = search_onetime_messages(number)
-    
-    top = Toplevel()
-    top.title(f"Risultati ricerca: '{number}'")
-    top.protocol("WM_DELETE_WINDOW", top.destroy)  # Chiude correttamente la finestra
-    
-    listbox = Listbox(top, width=120, height=20, font=('Consolas', 8))
-    scrollbar = Scrollbar(top, orient="vertical", command=listbox.yview)
-    listbox.config(yscrollcommand=scrollbar.set)
-    
-    for result in results_onetime:
-        listbox.insert("end", result)
-    
-    listbox.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-
-
-# Funzione per la ricerca delle localizzazioni
-def search_location_by_number(number):
-    query = """
-        SELECT
-            jid.user AS sender_number, 
-            message_location.place_name, 
-            message_location.place_address, 
-            message_location.latitude, 
-            message_location.longitude
-        FROM message
-        JOIN message_location
-            ON message._id = message_location.message_row_id
-            OR message.chat_row_id = message_location.chat_row_id 
-        JOIN jid ON message.sender_jid_row_id = jid._id
-        WHERE jid.user LIKE ?
-        ORDER BY message.timestamp DESC
-        LIMIT 100;
-    """
-    data = fetch_data(query, (f"%{number}%",))
-    
-    results = []
-    for row in data:
-        sender, name, addr, lat, lon = row
-
-        result = {
-            "sender": sender,
-            "place": name if name else "Sconosciuto",
-            "address": addr if addr else "Sconosciuto",
-            "latitude": lat,
-            "longitude": lon,
-        }
-        results.append(result)
-    
-    return results
-
-# Funzione per mostrare le posizioni sulla mappa
-def show_location_map(number):
-    data = search_location_by_number(number)
-
-    if not data:
-        print("Nessuna posizione trovata per questo numero.")
-        return
-    
-    # Creazione della mappa
-    map_ = folium.Map(location=[data[0]["latitude"], data[0]["longitude"]], zoom_start=12)
-
-    # Aggiunta dei marker con la data e ora corretta
-    for location in data:
-        popup_content = f"""
-            <div style="min-width:220px">
-                <b>Luogo:</b> {location["place"]}<br>
-                <b>Indirizzo:</b> {location["address"]}<br>
-                <b>Lat:</b> {location["latitude"]:.6f}<br>
-                <b>Lon:</b> {location["longitude"]:.6f}<br>
-            </div>
-        """
-        folium.Marker(
-            [location["latitude"], location["longitude"]],
-            popup=folium.Popup(popup_content, max_width=250),
-            icon=folium.Icon(color="blue", icon="map-marker")
-        ).add_to(map_)
-
-    # Salvataggio e apertura della mappa
-    map_filename = "mappa_posizioni.html"
-    map_.save(map_filename)
-    webbrowser.open(f'file://{os.path.realpath(map_filename)}')
-
-
-
-
-
-
-
-
-
-# Funzione per la ricerca degli ultimi messaggi
-def search_latest_messages(search_key):
-    """
-    Se `search_key` è un numero di telefono (solo cifre, eventualmente precedute da '+'),
-    lo usiamo come filtro su number; altrimenti lo consideriamo group_name.
-    """
-    # pattern per riconoscere un numero (6–15 cifre, opzionalmente con '+' davanti)
-    phone_pattern = re.compile(r'^\d{6,15}$')
-
-    number = search_key if phone_pattern.match(search_key) else None
-    group_name = search_key if number is None else None
-
-    # base della query
-    query = """
-        SELECT
-            CASE
-                WHEN chat.subject IS NOT NULL THEN sender_jid.user
-                ELSE chat_jid.user
-            END AS number,
-            chat.subject AS group_name,
-            message.timestamp AS message_timestamp, 
-            message.text_data AS text_data,
-            message.from_me AS from_me
-        FROM message 
-        INNER JOIN chat ON message.chat_row_id = chat._id
-        INNER JOIN jid AS chat_jid ON chat.jid_row_id = chat_jid._id
-        LEFT JOIN jid AS sender_jid ON message.sender_jid_row_id = sender_jid._id
-        WHERE 1=1
-    """
-    params = []
-
-    # aggiungo il filtro dinamico
-    if number:
-        query += """
-        AND number = ?
-        """
-        params.append(number)
-    else:
-        query += " AND chat.subject LIKE ?"
-        # aggiungo i wildcard % intorno al group_name
-        params.append(f"%{group_name}%")
-
-    query += " ORDER BY message.received_timestamp DESC LIMIT 100"
-
-    # eseguo la query
-    data = fetch_data(query, tuple(params))
-    
-    results_latest = []
-    for row in data:
-        number, group_name, message_timestamp, text_data, from_me = row
-
-        # Formattazione timestamp
-        if isinstance(message_timestamp, (int, float)) and message_timestamp > 0:
-            message_timestamp = datetime.fromtimestamp(message_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            message_timestamp = "Data non disponibile"
-        
-        if from_me:
-            results_latest.append(
-                f"DA: Questo numero | "
-                f"{'GRUPPO: ' + group_name + ' | ' if group_name else 'A: ' + number + ' | '}"
-                f"DATA INVIO: {message_timestamp} | "
-                f"TESTO: {text_data}"
-            )
-        else:
-            results_latest.append(
-                f"DA: {number} | "
-                f"{'GRUPPO: ' + group_name + ' | ' if group_name else 'A: Questo numero | '}"
-                f"DATA INVIO: {message_timestamp} | "
-                f"TESTO: {text_data}"
-            )
-
-    return results_latest
-
-# Funzione per mostrare i risultati della ricerca degli ultimi messaggi
-def show_latest_messages(number):
-    results_latest = search_latest_messages(number)
-    
-    top = Toplevel()
-    top.title(f"Risultati ricerca: '{number}'")
-    top.protocol("WM_DELETE_WINDOW", top.destroy)  # Chiude correttamente la finestra
-    
-    listbox = Listbox(top, width=120, height=20, font=('Consolas', 8))
-    scrollbar = Scrollbar(top, orient="vertical", command=listbox.yview)
-    listbox.config(yscrollcommand=scrollbar.set)
-    
-    for result in results_latest:
-        listbox.insert("end", result)
-    
-    listbox.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-
-
-
-
-
-
-
-
-
-
-
-# SEZIONE ANALISI AVANZATA
-
-# Funzione per analisi multivariata (media type e duration)
-def get_media_analysis():
-    try:
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# --- Icone in Base64 ---
+ICON_DATA = {
+    "welcome": "R0lGODlhIAAgAPcAAAAAAPSMhPSUlPSEOPSkoPS0tP////SioPSgoPSwsPSAgPCgoKCgoAAAAAAAAAAAAAAAACwAAAAAIAAgAAAI/wABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJsqXLlzBjypxJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izat3KtavXr2DDih1LtqzZs2jTql3Ltq3bt3Djyp1Lt67du3jz6t3Lt6/fv4ADCx5MuLDhw4gTK17MuLHjx5AjS55MubLly5gza97MubPnz6BDix5NurTpxp9FqF7NurXr17Bjy55Nu7bt27hz697Nu7fv38CDCx9OvLjx48iTK1/OvLnz59CjS59Ovbr169iza9/Ovbv37+DDi/8fT768+fPo06tfz769+/fw48ufT7++/fv48+vfz7+///8ABijggAQWaOCBCCao4IIMNujggxBGKOGEFFZo4YUYZqjhhhx26OGHIIYo4ogklmjiiSimqOKKLLbo4oswxijjjDTWaOONOOao44489ujjj0AGKeSQRBZp5JFIJqnkkkw26eSTUEYp5ZRUVmnllVhmqeWWXHbp5ZdghinmmGSWaeaZaKap5ppstunmm3DGKeecdNZp55145qnnnnz26eefgAYq6KCEFmrooYgmquiijDbq6KOQRirppJRWaumlmGaq6aacdurpp6CGKuqopJZq6qmopqrqqqy26uqrsMYq66y01mprrbjmquuuvPbq66/ABivssMQWa+yxyCar7LLMNuvss9BGK+201FZr7bXYZqvtttx26+234IYr7rjklmvuueimq+667Lbr7rvwxivvvPTWa++9+Oar77789uvvvwAHLPDABBds8MEIJ6zwwgw37PDDEEcs8cQUV2zxxRhnrPHGHHfs8ccghyzyyCSXbPLJKKes8sost+zyyzDHLPPMNNds880456zzzjz37PPPQAct9NBEF2300UgnrfTSTDft9NNQRy311FRXbfXVWGet9dZcd+3112CHLfbYZEsd9thop6322my37fbbcMct99x012333XjnrffefPft99+ABy744IQXbvjhiCeu+OKMN+7445BHLvnklFdu+eWYZ6755px37vnnoIcu+uikl2766ainrvrqrLfu+uuwxy777LTXbvvtXAAAIfkECQoAAAAsAAAAACAACAAACP8AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYsYM2rcyLGjx48gQ4ocSbKkyZMoU6pcybKly5cwY8qcSbOmzZs4c+rcybOnz59AgwodSrSo0aNIkypdyrSp06dQo0qdSrWq1atYs2rdyrWr169gw4odS7as2bNo06pdy7at27dw48qdS7eu3bt48+rdy7ev37+AAwseTLiw4cOIEytezLix48eQI0ueTLmy5cuYM2vezLmz58+gQ4seTbq06dOoU6tezbq169ewY8ueTbu27du4c+vezbu379/AgwsfTry48ePIkytfzry58+fQo0ufTr269evYs2vfzr279+/gw4v/H0++vPnz6NOrX8++vfv38OPLn0+/vv37+PPr38+/v///AAYo4IAEFmjggQgmqOCCDDbo4IMQRijhhBRWaOGFGGao4YYcdujhhyCGKOKIJJZo4okopqjiiiy26OKLMMYo44w01mjjjTjmqOOOPPbo449ABinkkEQWaeSRSCap5JJMNunkk1BHKWWADAAAIfkECQoAAAAsAAAAACAACAAACP8AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYsYM2rcyLGjx48gQ4ocSbKkyZMoU6pcybKly5cwY8qcSbOmzZs4c+rcybOnz59AgwodSrSo0aNIkypdyrSp06dQo0qdSrWq1atYs2rdyrWr169gw4odS7as2bNo06pdy7at27dw48qdS7eu3bt48+rdy7ev37+AAwseTLiw4cOIEytezLix48eQI0ueTLmy5cuYM2vezLmz58+gQ4seTbq06dOoU6tezbq169ewY8ueTbu27du4c+vezbu379/AgwsfTry48ePIkytfzry58+fQo0ufTr269evYs2vfzr279+/gw4v/H0++vPnz6NOrX8++vfv38OPLn0+/vv37+PPr38+/v///AAYo4IAEFmjggQgmqOCCDDbo4IMQRijhhBRWaOGFGGao4YYcdujhhyCGKOKIJJZo4okopqjiiiy26OKLMMYo44w01mjjjTjmqOOOPPbo449ABinkkEQWaeSRSCap5JJMNunkk1BHKWWADAAAIfkECQoAAAAsAAAAACAACAAACP8AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYsYM2rcyLGjx48gQ4ocSbKkyZMoU6pcybKly5cwY8qcSbOmzZs4c+rcybOnz59AgwodSrSo0aNIkypdyrSp06dQo0qdSrWq1atYs2rdyrWr169gw4odS7as2bNo06pdy7at27dw48qdS7eu3bt48+rdy7ev37+AAwseTLiw4cOIEytezLix48eQI0ueTLmy5cuYM2vezLmz58+gQ4seTbq06dOoU6tezbq169ewY8ueTbu27du4c+vezbu379/AgwsfTry48ePIkytfzry58+fQo0ufTr269evYs2vfzr279+/gw4v/H0++vPnz6NOrX8++vfv38OPLn0+/vv37+PPr38+/v///AAYo4IAEFmjggQgmqOCCDDbo4IMQRijhhBRWaOGFGGao4YYcdujhhyCGKOKIJJZo4okopqjiiiy26OKLMMYo44w01mjjjTjmqOOOPPbo449ABinkkEQWaeSRSCap5JJMNunkk1BHKWWADAAAIfkECQoAAAAsAAAAACAACAAACP8AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYsYM2rcyLGjx48gQ4ocSbKkyZMoU6pcybKly5cwY8qcSbOmzZs4c+rcybOnz59AgwodSrSo0aNIkypdyrSp06dQo0qdSrWq1atYs2rdyrWr169gw4odS7as2bNo06pdy7at27dw48qdS7eu3bt48+rdy7ev37+AAwseTLiw4cOIEytezLix48eQI0ueTLmy5cuYM2vezLmz58+gQ4seTbq06dOoU6tezbq169ewY8ueTbu27du4c+vezbu379/AgwsfTry48ePIkytfzry58+fQo0ufTr269evYs2vfzr279+/gw4v/H0++vPnz6NOrX8++vfv38OPLn0+/vv37+PPr38+/v///AAYo4IAEFmjggQgmqOCCDDbo4IMQRijhhBRWaOGFGGao4YYcdujhhyCGKOKIJJZo4okopqjiiiy26OKLMMYo44w01mjjjTjmqOOOPPbo449ABinkkEQWaeSRSCap5JJMNunkk1BHKWWADAAAIfkECQoAAAAsAAAAACAACAAACP8AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYsYM2rcyLGjx48gQ4ocSbKkyZMoU6pcybKly5cwY8qcSbOmzZs4c+rcybOnz59AgwodSrSo0aNIkypdyrSp06dQo0qdSrWq1atYs2rdyrWr169gw4odS7as2bNo06pdy7at27dw48qdS7eu3bt48+rdy7ev37+AAwseTLiw4cOIEytezLix48eQI0ueTLmy5cuYM2vezLmz58+gQ4seTbq06dOoU6tezbq169ewY8ueTbu27du4c+vezbu379/AgwsfTry48ePIkytfzry58+fQo0ufTr269evYs2vfzr279+/gw4v/H0++vPnz6NOrX8++vfv38OPLn0+/vv37+PPr38+/v///AAYo4IAEFmjggQgmqOCCDDbo4IMQRijhhBRWaOGFGGao4YYcdujhhyCGKOKIJJZo4okopqjiiiy26OKLMMYo44w01mjjjTjmqOOOPPbo449ABinkkEQWaeSRSCap5JJMNunkk1BHKWWADAAAIfkECQoAAAAsAAAAACAACAAACP8AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYsYM2rcyLGjx48gQ4ocSbKkyZMoU6pcybKly5cwY8qcSbOmzZs4c+rcybOnz59AgwodSrSo0aNIkypdyrSp06dQo0qdSrWq1atYs2rdyrWr169gw4odS7as2bNo06pdy7at27dw48qdS7eu3bt48+rdy7ev37+AAwseTLiw4cOIEytezLix48eQI0ueTLmy5cuYM2vezLmz58+gQ4seTbq06dOoU6tezbq169ewY8ueTbu27du4c+vezbu379/AgwsfTry48ePIkytfzry58+fQo0ufTr269evYs2vfzr279+/gw4v/H0++vPnz6NOrX8++vfv38OPLn0+/vv37+PPr38+/v///AAYo4IAEFmjggQgmqOCCDDbo4IMQRijhhBRWaOGFGGao4YYcdujhhyCGKOKIJJZo4okopqjiiiy26OKLMMYo44w01mjjjTjmqOOOPPbo449ABinkkEQWaeSRSCap5JJMNunkk1BHKWWADAAAIfkECQoAAAAsAAAAACAACAAACP8AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYsYM2rcyLGjx48gQ4ocSbKkyZMoU6pcybKly5cwY8qcSbOmzZs4c+rcybOnz59AgwodSrSo0aNIkypdyrSp06dQo0qdSrWq1atYs2rdyrWr169gw4odS7as2bNo06pdy7at27dw48qdS7eu3bt48+rdy7ev37+AAwseTLiw4cOIEytezLix48eQI0ueTLmy5cuYM2vezLmz58+gQ4seTbq06dOoU6tezbq169ewY8ueTbu27du4c+vezbu379/AgwsfTry48ePIkytfzry58+fQo0ufTr269evYs2vfzr279+/gw4v/H0++vPnz6NOrX8++vfv38OPLn0+/vv37+PPr38+/v///AAYo4IAEFmjggQgmqOCCDDbo4IMQRijhhBRWaOGFGGao4YYcdujhhyCGKOKIJJZo4okopqjiiiy26OKLMMYo44w01mjjjTjmqOOOPPbo449ABinkkEQWaeSRSCap5JJMNunkk1BHKWWADAAAOw==",
+    "chart_bar": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "chat": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "trash": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "clock": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "text": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "cloud": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "sentiment": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "search": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "map": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "media": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "timeline": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "heatmap": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "pdf": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7",
+    "cluster": "R0lGODlhGgAaAIAAAP///wAAACH5BAEAAAAALAAAAAAaABoAAAIjjI+py+0Po5y02otnAQA7"
+}
+
+# --- Classe di Gestione Database ---
+class DatabaseManager:
+    """Gestisce tutte le interazioni con il database SQLite di WhatsApp."""
+    def __init__(self, db_path):
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(f"Il file del database non è stato trovato: {db_path}")
+        self.db_path = db_path
+
+    def _connect_db(self):
+        try:
+            return sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            messagebox.showerror("Errore Database", f"Impossibile connettersi al database:\n{e}")
+            return None
+
+    def _fetch_data(self, query, params=None):
+        conn = self._connect_db()
+        if conn is None: return []
+        try:
+            cursor = conn.cursor()
+            cursor.execute(query, params or [])
+            return cursor.fetchall()
+        except sqlite3.Error as e:
+            messagebox.showerror("Errore Query SQL", f"Errore durante l'esecuzione della query:\n{e}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    def get_messages_for_clustering(self, limit=1000):
+        """Recupera messaggi testuali significativi per l'analisi di clustering."""
         query = """
-            SELECT 
-                mime_type,
-                ROUND(AVG(CASE WHEN media_duration > 0 THEN media_duration ELSE NULL END), 2) as avg_duration,
-                COUNT(*) as count
-            FROM message_media
-            WHERE 
-                mime_type IS NOT NULL AND
-                media_duration IS NOT NULL
-            GROUP BY mime_type
-            HAVING count > 5
-            ORDER BY count DESC;
+            SELECT
+                m.text_data
+            FROM message m
+            WHERE m.text_data IS NOT NULL
+              AND LENGTH(TRIM(m.text_data)) > 25
+              AND m.message_type = 0
+            LIMIT ?;
         """
-        return fetch_data(query)
-    except sqlite3.OperationalError:
-        return []
+        return self._fetch_data(query, (limit,))
 
-# Funzione per visualizzazione multivariata
-def plot_media_analysis():
-    def plot(fig):
-        data = get_media_analysis()
-        if not data:
-            ax = fig.add_subplot(111)
-            ax.set_title("Nessun dato media trovato...")
-            return
+    def get_deleted_messages(self, number_filter=None):
+        base_query = """
+            SELECT
+                CASE WHEN chat.subject IS NOT NULL THEN sender_jid.user ELSE chat_jid.user END,
+                chat.subject, message.timestamp, message_revoked.revoke_timestamp, message.from_me
+            FROM message_revoked
+            JOIN message ON message._id = message_revoked.message_row_id
+            JOIN chat ON message.chat_row_id = chat._id
+            JOIN jid AS chat_jid ON chat.jid_row_id = chat_jid._id
+            LEFT JOIN jid AS sender_jid ON message.sender_jid_row_id = sender_jid._id
+        """
+        params = []
+        if number_filter:
+            base_query += " WHERE (chat_jid.user LIKE ? OR sender_jid.user LIKE ?)"
+            params.extend([f"%{number_filter}%", f"%{number_filter}%"])
         
-        types, durations, counts = zip(*data)
-        
-        ax = fig.add_subplot(111)
-        fig.set_size_inches(12, 6)
-        bars = plt.barh(types, counts, color='skyblue')
-        plt.bar_label(bars, fmt='%d', padding=3)
-        ax.set_xlabel("Numero di messaggi")
-        ax.set_title("Distribuzione Tipi Media (Con almeno 5 occorrenze)")
-        
-        # Aggiungi durata media solo se presente
-        if any(durations):
-            ax2 = plt.gca().twiny()
-            ax2.plot(durations, types, 'ro-', alpha=0.5)
-            ax2.set_xlabel("Durata media (secondi)")
-        
-        plt.tight_layout()
-    
-    show_plot(plot)
+        # Corretto 'message_timestamp' con 'message.timestamp' che è il nome di colonna valido.
+        base_query += " ORDER BY message.timestamp DESC;"
+        return self._fetch_data(base_query, tuple(params))
 
+    def get_summary_stats(self):
+        query_messages = "SELECT COUNT(*) FROM message;"
+        query_chats = "SELECT COUNT(*) FROM chat;"
+        query_date_range = "SELECT MIN(timestamp), MAX(timestamp) FROM message WHERE timestamp > 0;"
+        total_messages = self._fetch_data(query_messages)[0][0] or 0
+        total_chats = self._fetch_data(query_chats)[0][0] or 0
+        date_range = self._fetch_data(query_date_range)
+        start_ts, end_ts = (None, None)
+        if date_range and date_range[0]:
+            start_ts, end_ts = date_range[0]
+        return {"total_messages": total_messages, "total_chats": total_chats, "start_date": start_ts, "end_date": end_ts}
 
-# Funzione per timeline messaggi
-def get_message_timeline():
-    try:
-        # Prima trova l'ultimo timestamp dal database
-        last_msg_query = "SELECT MAX(timestamp) FROM message WHERE timestamp > 0"
-        max_ts = fetch_data(last_msg_query)[0][0]
-
-        if not max_ts or max_ts <= 0:
-            raise ValueError("Nessun timestamp valido nel database")
-
-        # Converti l'ultimo timestamp a datetime
-        last_date = datetime.fromtimestamp(max_ts / 1000)
-        start_date = last_date - timedelta(days=365)
-
-        # Converti in millisecondi WhatsApp
-        min_ts = int(start_date.timestamp()) * 1000
-        max_ts = int(last_date.timestamp()) * 1000
-
+    def get_active_chats(self, limit=10):
         query = """
-            SELECT 
-                timestamp,
-                text_data,
-                message_type
-            FROM message
-            WHERE 
-                timestamp IS NOT NULL AND
-                timestamp >= ? AND 
-                timestamp <= ?
-            ORDER BY timestamp DESC;
+            SELECT
+                CASE WHEN chat.subject IS NOT NULL THEN chat.subject ELSE jid.user END,
+                COUNT(message._id)
+            FROM chat
+            JOIN jid ON chat.jid_row_id = jid._id
+            JOIN message ON chat._id = message.chat_row_id
+            GROUP BY 1 ORDER BY 2 DESC LIMIT ?;
         """
-        return fetch_data(query, (min_ts, max_ts))
-    
-    except Exception as e:
-        print(f"Errore database: {str(e)}")
-        return []
+        return self._fetch_data(query, (limit,))
 
-# Funzione per visualizzazione timeline
-def plot_timeline():
-    def plot(fig):
-        data = get_message_timeline()
-        if not data:
-            plt.title("Nessun dato trovato nel database")
-            plt.show()
-            return
+    def get_recent_chats(self, limit=20):
+        query = """
+            SELECT CASE WHEN c.subject IS NOT NULL THEN c.subject ELSE j.user END, MAX(m.timestamp)
+            FROM chat c JOIN jid j ON c.jid_row_id = j._id JOIN message m ON c._id = m.chat_row_id
+            GROUP BY 1 ORDER BY 2 DESC LIMIT ?;
+        """
+        return self._fetch_data(query, (limit,))
 
-        # I timestamp sono nel primo elemento di ogni riga
-        first_ts = data[0][0]
-        # Se il valore è maggiore di 1e10 lo consideriamo in ms, altrimenti in s
-        unit = 'ms' if first_ts > 1e10 else 's'
+    def get_ephemeral_chats(self):
+        query = """
+            SELECT j.user, c.subject, c.ephemeral_expiration
+            FROM chat c JOIN jid j ON c.jid_row_id = j._id WHERE c.ephemeral_expiration > 0
+        """
+        return self._fetch_data(query)
 
-        # Converte tutti i timestamp in datetime usando l'unità corretta
-        message_dates = pd.to_datetime([row[0] for row in data], unit=unit)
-        # "Normalizza" le date (imposta l'orario a mezzanotte) per raggruppare per giorno
-        message_dates = message_dates.normalize()
+    def get_all_text_messages(self):
+        query = "SELECT text_data FROM message WHERE text_data IS NOT NULL;"
+        return self._fetch_data(query)
 
-        # Determina l'ultimo giorno (massimo) e imposta il range degli ultimi 365 giorni
-        last_date = message_dates.max()
-        start_date = last_date - pd.Timedelta(days=365)
+    def get_text_for_sentiment(self):
+        query = """
+            SELECT text_data FROM message
+            WHERE message_type = 0 AND LENGTH(TRIM(text_data)) > 10 AND text_data NOT LIKE '%<omit%'
+        """
+        return self._fetch_data(query)
 
-        # Crea un intervallo continuo di date (giorno per giorno)
-        date_range = pd.date_range(start=start_date, end=last_date, freq='D')
+    def search_messages_by_word(self, word):
+        query = """
+            SELECT m.text_data, m.timestamp, m.from_me, s.user, r.user, c.subject
+            FROM message AS m
+            LEFT JOIN chat c ON m.chat_row_id = c._id
+            LEFT JOIN jid s ON m.sender_jid_row_id = s._id
+            LEFT JOIN jid r ON c.jid_row_id = r._id
+            WHERE m.text_data LIKE ? ORDER BY m.timestamp DESC LIMIT 100;
+        """
+        return self._fetch_data(query, (f"%{word}%",))
 
-        # Conta il numero di messaggi per ciascun giorno
-        daily_counts = pd.Series(message_dates).value_counts().sort_index()
-        # Reindicizza la serie per includere ogni giorno nell'intervallo (0 per i giorni senza messaggi)
-        daily_counts = daily_counts.reindex(date_range, fill_value=0)
+    def search_onetime_messages(self, number):
+        query = """
+            SELECT
+                CASE WHEN c.subject IS NOT NULL THEN s.user ELSE r.user END, c.subject,
+                m.received_timestamp, m.text_data, m.message_type, m.from_me
+            FROM message m
+            JOIN chat c ON m.chat_row_id = c._id
+            JOIN jid r ON c.jid_row_id = r._id
+            LEFT JOIN jid s ON m.sender_jid_row_id = s._id
+            WHERE (r.user LIKE ? OR s.user LIKE ?) AND m.message_type IN (42, 43, 82)
+            ORDER BY m.received_timestamp DESC;
+        """
+        return self._fetch_data(query, (f"%{number}%", f"%{number}%"))
 
-        # Crea il grafico a barre
-        ax = fig.add_subplot(111)
-        fig.set_size_inches(18, 6)
-        ax.bar(date_range, daily_counts.values, width=0.8, edgecolor='black')
-
-        # Formattta l'asse x per visualizzare le date in modo leggibile
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        plt.xticks(rotation=45, ha='right', fontsize=8)
-
-        ax.set_title(f"Distribuzione Giornaliera Messaggi (Ultimi 365 giorni)\nTotale messaggi: {len(data)}")
-        ax.set_xlabel("Giorno")
-        ax.set_ylabel("Numero Messaggi")
-        ax.grid(axis='y', linestyle='--', alpha=0.7)
-        plt.tight_layout()
-
-    show_plot(plot)
-
-
-# Funzione per l'analisi temporale (utile per HEATMAP)
-def get_interaction_data():
-    query = "SELECT timestamp FROM message WHERE timestamp IS NOT NULL"
-    return [row[0] for row in fetch_data(query)]
-
-# Funzione per visualizzare il calore delle interazioni per ora/giorno
-def plot_heatmap():
-    def plot(fig):  # Accetta la figura come parametro
-        timestamps = get_interaction_data()
+    def search_locations_by_number(self, number):
+        query = """
+            SELECT j.user, ml.place_name, ml.place_address, ml.latitude, ml.longitude, m.timestamp
+            FROM message m
+            JOIN message_location ml ON m._id = ml.message_row_id
+            JOIN jid j ON m.sender_jid_row_id = j._id
+            WHERE j.user LIKE ? ORDER BY m.timestamp DESC LIMIT 100;
+        """
+        return self._fetch_data(query, (f"%{number}%",))
         
-        if not timestamps:
-            ax = fig.add_subplot(111)
-            ax.set_title("Nessun dato disponibile")
-            return
+    def search_latest_messages(self, search_key):
+        is_phone = re.compile(r'^\+?\d{6,15}$').match(search_key)
+        query = """
+            SELECT
+                CASE WHEN c.subject IS NOT NULL THEN s.user ELSE r.user END, c.subject,
+                m.timestamp, m.text_data, m.from_me
+            FROM message m
+            JOIN chat c ON m.chat_row_id = c._id
+            JOIN jid r ON c.jid_row_id = r._id
+            LEFT JOIN jid s ON m.sender_jid_row_id = s._id
+        """
+        params = []
+        if is_phone:
+            query += " WHERE (r.user = ? OR s.user = ?)"
+            params.extend([search_key, search_key])
+        else:
+            query += " WHERE c.subject LIKE ?"
+            params.append(f"%{search_key}%")
+        query += " ORDER BY m.timestamp DESC LIMIT 100"
+        return self._fetch_data(query, tuple(params))
 
-        # Inizializza matrice 24h x 7giorni
-        heatmap_data = np.zeros((24, 7))
+    def get_media_analysis_data(self):
+        query = """
+            SELECT mime_type, ROUND(AVG(CASE WHEN media_duration > 0 THEN media_duration END), 2), COUNT(*)
+            FROM message_media WHERE mime_type IS NOT NULL GROUP BY 1 HAVING COUNT(*) > 5 ORDER BY 3 DESC;
+        """
+        return self._fetch_data(query)
+
+    def get_message_timestamps(self):
+        query = "SELECT timestamp FROM message WHERE timestamp IS NOT NULL"
+        return self._fetch_data(query)
+
+# --- Classe Principale della GUI ---
+class WhatsAppForensicsApp:
+    """Classe principale dell'applicazione GUI per l'analisi forense di WhatsApp."""
+    def __init__(self, root):
+        self.root = root
+        self.root.title("WhatsApp Forensics Toolkit")
+        self.root.geometry("1050x700")
+        self.root.minsize(900, 650)
+        self.db_manager = None
+        self.db_path = None
+        self.icons = {}
+        self.welcome_tab = None
+        self.clustering_enabled = CLUSTERING_ENABLED
+        self.nltk_stopwords_ready = False
+
+        self._setup_styles_and_icons()
+        self._create_widgets()
+
+    def _setup_styles_and_icons(self):
+        self.style = ttk.Style(self.root)
+        self.style.theme_use("clam")
+        self.colors = {"bg": "#ECECEC", "fg": "#333333", "button": "#FFFFFF", "accent": "#075E54"}
+        self.root.configure(bg=self.colors["bg"])
+        self.style.configure("TButton", padding=6, relief="flat", font=('Helvetica', 10), background=self.colors["button"], foreground=self.colors["fg"])
+        self.style.map("TButton", background=[('active', '#E0E0E0')])
+        self.style.configure("TLabelFrame", padding=10, font=('Helvetica', 11, 'bold'), foreground=self.colors["accent"])
+        self.style.configure("TNotebook", background=self.colors["bg"], borderwidth=0)
+        self.style.configure("TNotebook.Tab", font=('Helvetica', 10, 'bold'), padding=[10, 5], foreground=self.colors["fg"])
+        self.style.map("TNotebook.Tab", background=[("selected", self.colors["bg"])], foreground=[("selected", self.colors["accent"])])
+        self.style.configure("Accent.TButton", foreground="white", background=self.colors["accent"], font=('Helvetica', 11, 'bold'))
+        self.style.map("Accent.TButton", background=[('active', '#128C7E')])
         
-        # Popola la matrice
-        for ts in timestamps:
+        for name, b64_data in ICON_DATA.items():
             try:
-                dt = datetime.fromtimestamp(ts/1000)
-                hour = dt.hour
-                weekday = dt.weekday()  # 0=Lunedì, 6=Domenica
-                heatmap_data[hour, weekday] += 1
+                image_data = base64.b64decode(b64_data)
+                self.icons[name] = PhotoImage(data=image_data)
             except Exception as e:
-                print(f"Errore conversione timestamp: {e}")
-                continue
+                print(f"Errore nel caricare l'icona '{name}': {e}")
 
-        # Controllo dati non nulli
-        if np.sum(heatmap_data) == 0:
-            plt.figure(figsize=(10,6))
-            plt.title("Nessuna interazione registrata")
+    def _create_widgets(self):
+        menu_bar = Menu(self.root)
+        self.root.config(menu=menu_bar)
+        file_menu = Menu(menu_bar, tearoff=0)
+        menu_bar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Apri Database (msgstore.db)...", command=self._open_database)
+        file_menu.add_separator()
+        file_menu.add_command(label="Esci", command=self.root.quit)
+
+        self.status_bar = Label(self.root, text="Pronto. Aprire un database per iniziare.", bd=1, relief="sunken", anchor="w", padx=5)
+        self.status_bar.pack(side="bottom", fill="x")
+
+        self.notebook = ttk.Notebook(self.root, padding=10)
+        self.notebook.pack(expand=True, fill="both")
+        
+        self._create_welcome_tab()
+        
+        if not self.clustering_enabled:
+            messagebox.showwarning("Librerie Mancanti", "Le librerie per il clustering (scikit-learn, scipy, nltk) non sono installate. La scheda 'Analisi Clustering' non sarà disponibile.")
+
+    def _open_database(self):
+        db_path = askopenfilename(title="Seleziona il database msgstore.db", filetypes=[("Database SQLite", "*.db"), ("Tutti i file", "*.*")])
+        if db_path:
+            try:
+                self.db_manager = DatabaseManager(db_path)
+                self.db_path = db_path
+                self.status_bar.config(text=f"Database caricato: {os.path.basename(db_path)}")
+                self._populate_analysis_tabs()
+            except Exception as e:
+                messagebox.showerror("Errore Inizializzazione", f"Impossibile inizializzare il database o le schede di analisi:\n{e}")
+                self.status_bar.config(text="Errore nel caricamento del database.")
+
+    def _populate_analysis_tabs(self):
+        try:
+            # Rimuove la welcome tab se esiste
+            if self.welcome_tab and self.welcome_tab.winfo_exists():
+                self.notebook.forget(self.welcome_tab)
+                self.welcome_tab = None
+            # Pulisce le tab esistenti per un nuovo caricamento
+            for i in self.notebook.tabs():
+                self.notebook.forget(i)
+
+            # Crea le tab di analisi
+            self._create_chat_analysis_tab()
+            self._create_text_analysis_tab()
+            if self.clustering_enabled:
+                self._create_clustering_analysis_tab()
+            self._create_search_tab()
+            self._create_advanced_analysis_tab()
+            self._create_report_tab()
+        except Exception as e:
+            messagebox.showerror("Errore Creazione Tabs", f"Impossibile creare le schede di analisi:\n{e}")
+
+    def _create_tab_frame(self, tab_name, parent_notebook):
+        tab = ttk.Frame(parent_notebook, padding=10, style="TFrame")
+        parent_notebook.add(tab, text=tab_name)
+        frame = ttk.LabelFrame(tab, text=f"Funzioni di {tab_name}")
+        frame.pack(expand=True, fill="both", padx=10, pady=10)
+        return frame
+
+    def _add_button(self, parent, text, icon_name, command):
+        icon_to_use = self.icons.get(icon_name)
+        btn = ttk.Button(parent, text=text, image=icon_to_use, compound="left", command=command)
+        btn.pack(fill="x", pady=4, ipady=5)
+        return btn
+
+    def _create_welcome_tab(self):
+        self.welcome_tab = ttk.Frame(self.notebook, padding=20)
+        self.notebook.add(self.welcome_tab, text="Benvenuto")
+        
+        Label(self.welcome_tab, image=self.icons.get('welcome')).pack(pady=20)
+        Label(self.welcome_tab, text="WhatsApp Forensics Toolkit", font=("Helvetica", 18, "bold"), bg=self.colors["bg"], fg=self.colors["accent"]).pack(pady=10)
+        Label(self.welcome_tab, text="Per iniziare, apri un database WhatsApp (msgstore.db) dal menu 'File'.", font=("Helvetica", 11), bg=self.colors["bg"]).pack(pady=5)
+        ttk.Button(self.welcome_tab, text="Apri Database...", command=self._open_database, style="Accent.TButton").pack(pady=20, ipady=8)
+
+    def _create_chat_analysis_tab(self):
+        frame = self._create_tab_frame("Analisi Chat", self.notebook)
+        self._add_button(frame, "Top 10 Chat più Attive", "chart_bar", self._plot_active_chats)
+        self._add_button(frame, "Ultime 20 Chat Attive", "chat", self._show_recent_chats)
+        self._add_button(frame, "Mostra Messaggi Cancellati", "trash", lambda: self._show_deleted_messages())
+        self._add_button(frame, "Chat con Messaggi Effimeri", "clock", self._show_ephemeral_chats)
+
+    def _create_text_analysis_tab(self):
+        frame = self._create_tab_frame("Analisi Testuale", self.notebook)
+        self._add_button(frame, "Top 20 Parole più Usate", "text", lambda: self._plot_word_histogram(min_len=1))
+        self._add_button(frame, "Top 20 Parole (min. 4 lettere)", "text", lambda: self._plot_word_histogram(min_len=4))
+        self._add_button(frame, "Genera WordCloud", "cloud", self._plot_wordcloud)
+        self._add_button(frame, "Distribuzione del Sentiment", "sentiment", self._plot_sentiment)
+
+    def _create_clustering_analysis_tab(self):
+        frame = self._create_tab_frame("Analisi Clustering", self.notebook)
+        self._add_button(frame, "Clustering Gerarchico (Dendrogramma)", "cluster", self._perform_hierarchical_clustering)
+        self._add_button(frame, "Clustering K-Means", "cluster", self._perform_kmeans_clustering)
+
+    def _create_search_tab(self):
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="Ricerche")
+        
+        search_word_frame = ttk.LabelFrame(tab, text="Ricerca per Parola Chiave")
+        search_word_frame.pack(fill="x", padx=10, pady=10)
+        self.search_entry = ttk.Entry(search_word_frame, font=('Helvetica', 10))
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=5, ipady=4)
+        ttk.Button(search_word_frame, text=" Cerca", image=self.icons.get('search'), compound="left", command=self._search_by_keyword).pack(side="right", padx=5)
+
+        search_num_frame = ttk.LabelFrame(tab, text="Ricerca per Numero di Telefono o Nome Gruppo")
+        search_num_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        Label(search_num_frame, text="Inserisci numero o nome:", font=('Helvetica', 9)).pack(anchor='w', padx=5)
+        self.number_entry = ttk.Entry(search_num_frame, font=('Helvetica', 10))
+        self.number_entry.pack(fill="x", padx=5, pady=(0, 10), ipady=4)
+
+        btn_frame = ttk.Frame(search_num_frame)
+        btn_frame.pack(fill='x', expand=True, anchor="n")
+        
+        self._add_button(btn_frame, "Ultimi 100 Messaggi", "chat", self._search_latest_messages)
+        self._add_button(btn_frame, "Messaggi Cancellati", "trash", self._search_deleted_messages_by_number)
+        self._add_button(btn_frame, "Messaggi 'Vedi una volta'", "clock", self._search_onetime_messages)
+        self._add_button(btn_frame, "Posizioni (Mappa)", "map", self._show_location_map)
+
+    def _create_advanced_analysis_tab(self):
+        frame = self._create_tab_frame("Analisi Avanzata", self.notebook)
+        self._add_button(frame, "Analisi dei Tipi di Media", "media", self._plot_media_analysis)
+        self._add_button(frame, "Timeline Messaggi", "timeline", self._plot_timeline)
+        self._add_button(frame, "Heatmap delle Interazioni", "heatmap", self._plot_heatmap)
+
+    def _create_report_tab(self):
+        frame = self._create_tab_frame("Report", self.notebook)
+        self._add_button(frame, "Genera Report PDF", "pdf", self._open_report_window)
+    
+    def _prepare_nltk_stopwords(self):
+        """Controlla e scarica le stopwords di NLTK solo se necessario."""
+        if self.nltk_stopwords_ready:
+            return True
+        try:
+            from nltk.corpus import stopwords
+            stopwords.words('italian')
+            self.nltk_stopwords_ready = True
+            return True
+        except LookupError:
+            self.status_bar.config(text="Download del pacchetto 'stopwords' di NLTK in corso...")
+            self.root.update_idletasks()
+            if messagebox.askyesno("Download Necessario", "Il pacchetto 'stopwords' di NLTK per l'italiano non è stato trovato. Vuoi scaricarlo ora?"):
+                try:
+                    nltk.download('stopwords')
+                    self.nltk_stopwords_ready = True
+                    self.status_bar.config(text="Download completato.")
+                    return True
+                except Exception as e:
+                    messagebox.showerror("Errore Download", f"Impossibile scaricare il pacchetto NLTK:\n{e}")
+                    self.status_bar.config(text="Download fallito.")
+                    return False
+            else:
+                self.status_bar.config(text="Download annullato.")
+                return False
+        except Exception as e:
+            messagebox.showerror("Errore NLTK", f"Errore durante l'inizializzazione di NLTK:\n{e}")
+            return False
+
+    def _show_plot(self, plot_function, title, figsize=(10,6)):
+        self.status_bar.config(text=f"Generazione grafico: {title}...")
+        self.root.update_idletasks()
+        try:
+            plt.style.use('seaborn-v0_8-whitegrid')
+            plt.close('all')
+            fig = plt.figure(figsize=figsize)
+            plot_function(fig)
+            plt.tight_layout(pad=2.0)
             plt.show()
+            self.status_bar.config(text="Grafico generato con successo.")
+        except Exception as e:
+            messagebox.showerror("Errore Grafico", f"Impossibile generare il grafico:\n{e}")
+            self.status_bar.config(text="Errore durante la generazione del grafico.")
+        finally:
+            plt.close('all')
+
+    def _format_timestamp(self, ts, default="N/D"):
+        if ts and isinstance(ts, (int, float)) and ts > 0:
+            unit = 1000 if ts > 1e12 else 1
+            return datetime.fromtimestamp(ts / unit).strftime('%Y-%m-%d %H:%M:%S')
+        return default
+
+    def _create_results_window(self, title, data, is_text_content=False):
+        if not data:
+            messagebox.showinfo("Nessun Risultato", "La ricerca non ha prodotto risultati.")
             return
 
-        # Normalizzazione migliorata
-        max_val = np.max(heatmap_data)
-        norm = plt.Normalize(vmin=0, vmax=max_val if max_val > 0 else 1)
+        top = Toplevel(self.root)
+        top.title(title)
+        top.geometry("800x500")
 
-        # Configurazione grafica
-        ax = fig.add_subplot(111)
-        fig.set_size_inches(12, 8)
-        ax = plt.gca()
+        frame = Frame(top)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # Crea heatmap con annotazioni
-        im = ax.imshow(heatmap_data, cmap='YlOrRd', aspect='auto',
-                      norm=norm, origin='lower')
+        if is_text_content:
+            text_area = Text(frame, wrap="word", font=('Consolas', 10))
+            scrollbar_y = ttk.Scrollbar(frame, orient="vertical", command=text_area.yview)
+            text_area.config(yscrollcommand=scrollbar_y.set)
+            text_area.insert("1.0", data)
+            text_area.config(state="disabled")
+            scrollbar_y.pack(side="right", fill="y")
+            text_area.pack(side="left", fill="both", expand=True)
+        else:
+            listbox = Listbox(frame, font=('Consolas', 9))
+            scrollbar_y = Scrollbar(frame, orient="vertical", command=listbox.yview)
+            scrollbar_x = Scrollbar(frame, orient="horizontal", command=listbox.xview)
+            listbox.config(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+            for item in data: listbox.insert("end", item)
+            scrollbar_y.pack(side="right", fill="y")
+            scrollbar_x.pack(side="bottom", fill="x")
+            listbox.pack(side="left", fill="both", expand=True)
 
-        # Etichette assi dettagliate
-        giorni = ['Lunedì', 'Martedì', 'Mercoledì', 
-                'Giovedì', 'Venerdì', 'Sabato', 'Domenica']
-        ore = [f"{h:02d}:00" for h in range(24)]
-        
-        ax.set_xticks(np.arange(7))
-        ax.set_xticklabels(giorni, rotation=45, ha='right')
-        ax.set_yticks(np.arange(24))
-        ax.set_yticklabels(ore)
-        ax.tick_params(axis='both', which='major', labelsize=8)
+    def _plot_active_chats(self):
+        data = self.db_manager.get_active_chats()
+        if not data: return messagebox.showinfo("Informazione", "Nessuna chat attiva trovata.")
+        def plot(fig):
+            chat_ids, counts = zip(*data)
+            ax = fig.add_subplot(111)
+            ax.barh(chat_ids, counts, color='#075E54')
+            ax.set_xlabel("Numero di Messaggi"); ax.set_ylabel("Chat"); ax.set_title("Top 10 Chat più Attive")
+            ax.invert_yaxis()
+        self._show_plot(plot, "Chat Attive")
 
-        # Griglia e colorbar
-        ax.set_xticks(np.arange(7)+0.5, minor=True)
-        ax.set_yticks(np.arange(24)+0.5, minor=True)
-        ax.grid(which='minor', color='white', linestyle='-', linewidth=0.5)
-        
-        cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('Numero di Messaggi', rotation=270, labelpad=20)
+    def _show_recent_chats(self):
+        self.status_bar.config(text="Caricamento chat recenti...")
+        data = self.db_manager.get_recent_chats()
+        formatted = [f"{i}. {row[0]} (Ultimo: {self._format_timestamp(row[1])})" for i, row in enumerate(data, 1)]
+        self._create_results_window("Ultime 20 Chat Attive", formatted)
+        self.status_bar.config(text="Pronto.")
 
-        # Annotazioni valori
-        threshold = max_val * 0.5  # Soglia per il contrasto del testo
-        for i in range(24):
-            for j in range(7):
-                color = 'white' if heatmap_data[i, j] > threshold else 'black'
-                ax.text(j, i, f"{int(heatmap_data[i, j])}",
-                       ha="center", va="center",
-                       color=color, fontsize=6)
+    def _show_deleted_messages(self, number=None):
+        self.status_bar.config(text="Ricerca messaggi cancellati...")
+        data = self.db_manager.get_deleted_messages(number)
+        results = []
+        for phone, group, msg_ts, rev_ts, from_me in data:
+            direction = f"DA: Tu | A: {phone or 'Sconosciuto'}" if from_me else f"DA: {phone or 'Sconosciuto'} | A: Tu"
+            group_info = f" | GRUPPO: {group}" if group else ""
+            results.append(f"{direction}{group_info} | INVIO: {self._format_timestamp(msg_ts)} | CANCELLAZIONE: {self._format_timestamp(rev_ts)}")
+        title = f"Messaggi Cancellati (Filtro: {number})" if number else "Tutti i Messaggi Cancellati"
+        self._create_results_window(title, results)
+        self.status_bar.config(text="Pronto.")
 
-        plt.title('Mappa Calore delle Interazioni - Frequenza Messaggi per Ora/Giorno\n', fontsize=12)
+    def _show_ephemeral_chats(self):
+        self.status_bar.config(text="Caricamento chat effimere...")
+        data = self.db_manager.get_ephemeral_chats()
+        results = [f"{(f'GRUPPO: {g}' if g else f'NUMERO: {p}')} | TIMER: {int(e / 86400)} giorni" for p, g, e in data]
+        self._create_results_window("Chat con Messaggi Effimeri", results)
+        self.status_bar.config(text="Pronto.")
+
+    def _plot_word_histogram(self, min_len=1):
+        self.status_bar.config(text="Analisi frequenza parole...")
+        text_data = self.db_manager.get_all_text_messages()
+        if not text_data: return messagebox.showinfo("Informazione", "Nessun messaggio di testo trovato.")
+        words = " ".join(row[0] for row in text_data).lower().split()
+        if min_len > 1:
+            words = [word.strip('.,!?()[]{}"\'') for word in words if len(word) >= min_len]
+        if not words: return messagebox.showinfo("Informazione", "Nessuna parola trovata con i criteri specificati.")
+        word_counts = Counter(words).most_common(20)
+        def plot(fig):
+            common_words, counts = zip(*word_counts)
+            ax = fig.add_subplot(111)
+            ax.barh(common_words, counts, color='#128C7E')
+            ax.set_title(f"Top 20 Parole più Utilizzate (min. {min_len} lettere)")
+            ax.invert_yaxis()
+        self._show_plot(plot, f"Frequenza Parole (min {min_len})")
+
+    def _plot_wordcloud(self):
+        self.status_bar.config(text="Generazione WordCloud...")
+        text_data = self.db_manager.get_all_text_messages()
+        if not text_data: return messagebox.showinfo("Informazione", "Nessun testo per la WordCloud.")
+        text = " ".join(row[0] for row in text_data)
+        words = [word.strip('.,!?()[]{}"\'') for word in text.lower().split() if len(word) >= 4]
+        if not words: return messagebox.showinfo("Informazione", "Nessuna parola sufficiente per la WordCloud.")
+        def plot(fig):
+            wordcloud = WordCloud(width=800, height=400, background_color='white', colormap='viridis').generate(" ".join(words))
+            ax = fig.add_subplot(111)
+            ax.imshow(wordcloud, interpolation='bilinear')
+            ax.axis("off"); ax.set_title("WordCloud delle Parole Più Usate")
+        self._show_plot(plot, "WordCloud")
+
+    def _plot_sentiment(self):
+        self.status_bar.config(text="Analisi sentiment...")
+        data = self.db_manager.get_text_for_sentiment()
+        if not data: return messagebox.showinfo("Informazione", "Nessun testo per l'analisi del sentiment.")
+        sentiments = [TextBlob(row[0]).sentiment.polarity for row in data]
+        def plot(fig):
+            ax = fig.add_subplot(111)
+            ax.hist(sentiments, bins=20, color='purple', alpha=0.7)
+            ax.set_title('Distribuzione del Sentiment dei Messaggi'); ax.set_xlabel('Polarità (-1 Negativo, 1 Positivo)'); ax.set_ylabel('Frequenza')
+        self._show_plot(plot, "Analisi Sentiment")
+
+    def _perform_hierarchical_clustering(self):
+        if not self._prepare_nltk_stopwords(): return
+        from nltk.corpus import stopwords
+        self.status_bar.config(text="Avvio analisi gerarchica..."); self.root.update_idletasks()
+        message_data = self.db_manager.get_messages_for_clustering(limit=100)
+        if not message_data or len(message_data) < 2:
+            messagebox.showinfo("Dati Insufficienti", "Non ci sono abbastanza messaggi (min 2) per l'analisi."); self.status_bar.config(text="Pronto."); return
+        messagebox.showinfo("Nota", "Il clustering gerarchico verrà eseguito su un campione di max 100 messaggi per garantire la leggibilità del dendrogramma.")
+        self.status_bar.config(text="Vettorizzazione del testo..."); self.root.update_idletasks()
+        vectorizer = TfidfVectorizer(max_features=100, stop_words=stopwords.words('italian'))
+        docs = [row[0] for row in message_data]
+        tfidf_matrix = vectorizer.fit_transform(docs)
+        self.status_bar.config(text="Calcolo del linkage..."); self.root.update_idletasks()
+        linked = linkage(tfidf_matrix.toarray(), method='ward')
+        def plot(fig):
+            ax = fig.add_subplot(111)
+            dendrogram(linked, orientation='top', distance_sort='descending', show_leaf_counts=True, ax=ax)
+            ax.set_title("Dendrogramma del Clustering Gerarchico"); ax.set_ylabel("Distanza")
+        self._show_plot(plot, "Dendrogramma Gerarchico", figsize=(12, 7))
+        self.status_bar.config(text="Pronto.")
+
+    def _perform_kmeans_clustering(self):
+        if not self._prepare_nltk_stopwords(): return
+        from nltk.corpus import stopwords
+        k = askinteger("Numero di Cluster", "Inserisci il numero di cluster (k) desiderato:", initialvalue=5, minvalue=2, maxvalue=20)
+        if not k: return
+        self.status_bar.config(text=f"Avvio analisi K-Means con k={k}..."); self.root.update_idletasks()
+        message_data = self.db_manager.get_messages_for_clustering(limit=2000)
+        if not message_data or len(message_data) < k:
+            messagebox.showinfo("Dati Insufficienti", f"Non ci sono abbastanza messaggi per creare {k} cluster."); self.status_bar.config(text="Pronto."); return
+        self.status_bar.config(text="Vettorizzazione del testo..."); self.root.update_idletasks()
+        vectorizer = TfidfVectorizer(max_df=0.8, min_df=5, stop_words=stopwords.words('italian'))
+        docs = [row[0] for row in message_data]
+        tfidf_matrix = vectorizer.fit_transform(docs)
+        self.status_bar.config(text="Esecuzione di K-Means..."); self.root.update_idletasks()
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(tfidf_matrix)
+        clusters = kmeans.labels_
+        pca = PCA(n_components=2, random_state=42)
+        coords = pca.fit_transform(tfidf_matrix.toarray())
+        def plot(fig):
+            ax = fig.add_subplot(111)
+            scatter = ax.scatter(coords[:, 0], coords[:, 1], c=clusters, cmap='viridis', alpha=0.7)
+            ax.set_title(f'Visualizzazione Cluster K-Means (k={k}) con PCA')
+            legend1 = ax.legend(*scatter.legend_elements(), title="Cluster"); ax.add_artist(legend1)
+        self._show_plot(plot, f"Cluster K-Means (k={k})")
+        self.status_bar.config(text="Calcolo parole chiave per cluster..."); self.root.update_idletasks()
+        results_text = f"Parole chiave per i {k} cluster individuati:\n" + "="*40 + "\n\n"
+        order_centroids = kmeans.cluster_centers_.argsort()[:, ::-1]
+        try:
+            terms = vectorizer.get_feature_names_out()
+        except AttributeError:
+            terms = vectorizer.get_feature_names()
+        for i in range(k):
+            top_words = [terms[ind] for ind in order_centroids[i, :10]]
+            results_text += f"Cluster {i}:\n" + ", ".join(top_words) + "\n\n"
+        self._create_results_window(f"Parole Chiave per Cluster (k={k})", results_text, is_text_content=True)
+        self.status_bar.config(text="Pronto.")
+
+    def _search_by_keyword(self):
+        word = self.search_entry.get().strip()
+        if not word: return messagebox.showwarning("Input Mancante", "Inserisci una parola da cercare.")
+        self.status_bar.config(text=f"Ricerca di '{word}'..."); self.root.update_idletasks()
+        data = self.db_manager.search_messages_by_word(word)
+        results = [f"{self._format_timestamp(ts)} | {(f'GRUPPO: {g} | DA: {s}' if g else f'DA: Tu | A: {r}' if from_me else f'DA: {s} | A: Tu')} | MSG: {txt}" for txt, ts, from_me, s, r, g in data]
+        self._create_results_window(f"Risultati per '{word}'", results)
+        self.status_bar.config(text="Pronto.")
+
+    def _search_latest_messages(self):
+        key = self.number_entry.get().strip()
+        if not key: return messagebox.showwarning("Input Mancante", "Inserisci un numero o nome gruppo.")
+        self.status_bar.config(text=f"Ricerca ultimi messaggi per '{key}'..."); self.root.update_idletasks()
+        data = self.db_manager.search_latest_messages(key)
+        results = [f"{self._format_timestamp(ts)} | {(f'DA: Tu | GRUPPO: {g}' if from_me and g else f'DA: Tu | A: {n}' if from_me else f'DA: {n} | GRUPPO: {g}' if g else f'DA: {n} | A: Tu')} | TESTO: {txt or '[Media]'}" for n, g, ts, txt, from_me in data]
+        self._create_results_window(f"Ultimi messaggi per '{key}'", results)
+        self.status_bar.config(text="Pronto.")
+
+    def _search_deleted_messages_by_number(self):
+        number = self.number_entry.get().strip()
+        if not number: return messagebox.showwarning("Input Mancante", "Inserisci un numero per filtrare.")
+        self._show_deleted_messages(number)
+
+    def _search_onetime_messages(self):
+        number = self.number_entry.get().strip()
+        if not number: return messagebox.showwarning("Input Mancante", "Inserisci un numero.")
+        data = self.db_manager.search_onetime_messages(number)
+        type_map = {42: "IMMAGINE", 43: "VIDEO", 82: "AUDIO"}
+        results = [f"{self._format_timestamp(ts)} | {(f'DA: Tu | A: {n}' if from_me else f'DA: {n} | A: Tu')} | TIPO: {type_map.get(tid, 'Sconosciuto')}" for n, g, ts, txt, tid, from_me in data]
+        self._create_results_window(f"Messaggi 'Vedi una volta' per '{number}'", results)
+
+    def _show_location_map(self):
+        number = self.number_entry.get().strip()
+        if not number: return messagebox.showwarning("Input Mancante", "Inserisci un numero.")
+        data = self.db_manager.search_locations_by_number(number)
+        if not data: return messagebox.showinfo("Nessun Risultato", f"Nessuna posizione trovata per '{number}'.")
+        map_center = [data[0][3], data[0][4]]
+        m = folium.Map(location=map_center, zoom_start=13)
+        for _, name, addr, lat, lon, ts in data:
+            popup_content = f"<b>Data:</b> {self._format_timestamp(ts)}<br><b>Luogo:</b> {name or 'N/D'}<br><b>Indirizzo:</b> {addr or 'N/D'}"
+            folium.Marker([lat, lon], popup=folium.Popup(popup_content, max_width=300), tooltip=name or self._format_timestamp(ts)).add_to(m)
+        map_filename = "mappa_posizioni.html"
+        m.save(map_filename)
+        webbrowser.open(f'file://{os.path.realpath(map_filename)}')
+
+    def _plot_media_analysis(self):
+        data = self.db_manager.get_media_analysis_data()
+        if not data: return messagebox.showinfo("Informazione", "Nessun dato media per l'analisi.")
+        def plot(fig):
+            types, _, counts = zip(*data)
+            ax = fig.add_subplot(111)
+            ax.barh([t.split('/')[1] for t in types], counts, color='teal', alpha=0.8)
+            ax.set_title("Distribuzione Tipi di Media")
+        self._show_plot(plot, "Analisi Media")
+
+    def _plot_timeline(self):
+        timestamps = self.db_manager.get_message_timestamps()
+        if not timestamps: return messagebox.showinfo("Informazione", "Nessun messaggio per la timeline.")
+        unit = 'ms' if timestamps[0][0] > 1e12 else 's'
+        dates = pd.to_datetime([row[0] for row in timestamps], unit=unit).normalize()
+        date_range = pd.date_range(start=dates.min(), end=dates.max(), freq='D')
+        counts = dates.value_counts().reindex(date_range, fill_value=0)
+        def plot(fig):
+            ax = fig.add_subplot(111)
+            ax.bar(date_range, counts.values, color='royalblue')
+            ax.set_title("Timeline Messaggi"); fig.autofmt_xdate()
+        self._show_plot(plot, "Timeline Messaggi", figsize=(14,7))
+
+    def _plot_heatmap(self):
+        timestamps = self.db_manager.get_message_timestamps()
+        if not timestamps: return messagebox.showinfo("Informazione", "Nessun dato per la heatmap.")
+        heatmap_data = np.zeros((24, 7))
+        unit = 1000 if timestamps[0][0] > 1e12 else 1
+        for ts_tuple in timestamps:
+            try:
+                dt = datetime.fromtimestamp(ts_tuple[0] / unit)
+                heatmap_data[dt.hour, dt.weekday()] += 1
+            except (ValueError, OSError): continue
+        def plot(fig):
+            ax = fig.add_subplot(111)
+            im = ax.imshow(heatmap_data, cmap='YlOrRd', aspect='auto', origin='lower')
+            ax.set_xticks(np.arange(7), ['Lunedì', 'Martedì', 'Mercoledì', 'Giovedì', 'Venerdì', 'Sabato', 'Domenica'], rotation=45, ha='right')
+            ax.set_yticks(np.arange(24), [f"{h:02d}:00" for h in range(24)])
+            plt.colorbar(im, ax=ax, label='Numero di Messaggi')
+            ax.set_title('Heatmap delle Interazioni')
+        self._show_plot(plot, "Heatmap Interazioni")
+
+    def _generate_plot_to_buffer(self, plot_function, figsize):
+        buffer = io.BytesIO()
+        plt.style.use('seaborn-v0_8-whitegrid')
+        fig = plt.figure(figsize=figsize)
+        plot_function(fig)
         plt.tight_layout()
+        plt.savefig(buffer, format='png', dpi=300)
+        plt.close(fig)
+        buffer.seek(0)
+        return buffer
 
-    show_plot(plot)
+    def _generate_active_chats_plot_for_pdf(self):
+        data = self.db_manager.get_active_chats()
+        if not data: return None
+        def plot(fig):
+            chat_ids, counts = zip(*data); ax = fig.add_subplot(111); ax.barh(chat_ids, counts, color='#075E54')
+            ax.set_title("Top 10 Chat Attive"); ax.set_xlabel("Numero di Messaggi"); ax.invert_yaxis()
+        buffer = self._generate_plot_to_buffer(plot, (8, 4))
+        return Image(buffer, width=15*cm, height=7.5*cm)
 
+    def _generate_media_analysis_plot_for_pdf(self):
+        data = self.db_manager.get_media_analysis_data()
+        if not data: return None
+        def plot(fig):
+            types, _, counts = zip(*data); ax = fig.add_subplot(111); ax.barh([t.split('/')[1] for t in types], counts, color='teal')
+            ax.set_title("Distribuzione Tipi di Media"); ax.set_xlabel("Conteggio"); ax.invert_yaxis()
+        buffer = self._generate_plot_to_buffer(plot, (8, 4))
+        return Image(buffer, width=15*cm, height=7.5*cm)
 
-# CREAZIONE GUI
+    def _generate_timeline_plot_for_pdf(self):
+        timestamps = self.db_manager.get_message_timestamps()
+        if not timestamps: return None
+        unit = 'ms' if timestamps[0][0] > 1e12 else 's'
+        dates = pd.to_datetime([row[0] for row in timestamps], unit=unit).normalize()
+        counts = dates.value_counts().sort_index()
+        def plot(fig):
+            ax = fig.add_subplot(111); ax.plot(counts.index, counts.values, color='royalblue')
+            ax.set_title("Timeline Attività Messaggi"); ax.set_ylabel("Numero di Messaggi"); fig.autofmt_xdate()
+        buffer = self._generate_plot_to_buffer(plot, (10, 5))
+        return Image(buffer, width=16*cm, height=8*cm)
+        
+    def _generate_sentiment_plot_for_pdf(self):
+        data = self.db_manager.get_text_for_sentiment()
+        if not data: return None
+        sentiments = [TextBlob(row[0]).sentiment.polarity for row in data]
+        def plot(fig):
+            ax = fig.add_subplot(111); ax.hist(sentiments, bins=20, color='purple', alpha=0.7)
+            ax.set_title('Distribuzione del Sentiment'); ax.set_xlabel('Polarità'); ax.set_ylabel('Frequenza')
+        buffer = self._generate_plot_to_buffer(plot, (8, 4))
+        return Image(buffer, width=15*cm, height=7.5*cm)
 
+    def _generate_heatmap_plot_for_pdf(self):
+        timestamps = self.db_manager.get_message_timestamps()
+        if not timestamps: return None
+        heatmap_data = np.zeros((24, 7)); unit = 1000 if timestamps[0][0] > 1e12 else 1
+        for ts_tuple in timestamps:
+            try: dt = datetime.fromtimestamp(ts_tuple[0] / unit); heatmap_data[dt.hour, dt.weekday()] += 1
+            except (ValueError, OSError): continue
+        buffer = io.BytesIO()
+        plt.style.use('seaborn-v0_8-whitegrid'); plt.figure(figsize=(8, 5)); ax = plt.subplot(111)
+        im = ax.imshow(heatmap_data, cmap='YlOrRd', aspect='auto', origin='lower')
+        ax.set_xticks(np.arange(7), ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom'])
+        ax.set_yticks(np.arange(0, 24, 2)); ax.set_title('Heatmap delle Interazioni (Giorno/Ora)')
+        plt.colorbar(im, ax=ax, label='N. Messaggi'); plt.tight_layout()
+        plt.savefig(buffer, format='png', dpi=300); plt.close(); buffer.seek(0)
+        return Image(buffer, width=14*cm, height=8*cm)
+        
+    def _generate_wordcloud_plot_for_pdf(self):
+        text_data = self.db_manager.get_all_text_messages()
+        if not text_data: return None
+        text = " ".join(row[0] for row in text_data)
+        words = [word.strip('.,!?()[]{}"\'') for word in text.lower().split() if len(word) >= 4]
+        if not words: return None
+        buffer = io.BytesIO()
+        wordcloud = WordCloud(width=800, height=400, background_color='white', colormap='viridis').generate(" ".join(words))
+        plt.figure(figsize=(8, 4)); plt.imshow(wordcloud, interpolation='bilinear'); plt.axis("off"); plt.tight_layout()
+        plt.savefig(buffer, format='png', dpi=300); plt.close(); buffer.seek(0)
+        return Image(buffer, width=16*cm, height=8*cm)
 
-# Funzione di creazione della GUI
-def create_gui():
-    root = Tk()
-    root.title("WhatsApp Forensics Toolkit - Enhanced")
-    root.geometry("900x600")
-    root.minsize(800, 500)
-    
-    # Main container
-    main_frame = Frame(root)
-    main_frame.pack(fill="both", expand=True, padx=15, pady=15)
-    
-    # Configurazione griglia responsive
-    main_frame.columnconfigure(0, weight=1, uniform="group1")
-    main_frame.columnconfigure(1, weight=1, uniform="group1")
-    main_frame.rowconfigure(0, weight=1)
-    main_frame.rowconfigure(1, weight=1)
+    def _open_report_window(self):
+        top = Toplevel(self.root); top.title("Genera Report PDF"); top.geometry("600x750")
+        plot_frame = ttk.LabelFrame(top, text="Seleziona i grafici da includere")
+        plot_frame.pack(pady=10, padx=10, fill="x")
+        self.report_vars = {}
+        report_plot_options = {
+            "active_chats": "Grafico Chat più Attive", "media_types": "Grafico Tipi di Media",
+            "timeline": "Grafico Timeline Messaggi", "sentiment": "Grafico Analisi del Sentiment",
+            "heatmap": "Heatmap delle Interazioni", "wordcloud": "WordCloud delle Parole"
+        }
+        for key, label in report_plot_options.items():
+            var = BooleanVar(value=True); self.report_vars[key] = var
+            chk = ttk.Checkbutton(plot_frame, text=label, variable=var); chk.pack(anchor="w", padx=10, pady=2)
+        notes_frame = ttk.LabelFrame(top, text="Considerazioni del Consulente Tecnico")
+        notes_frame.pack(expand=True, fill="both", padx=10, pady=(0, 10))
+        text_widget = Text(notes_frame, wrap="word", font=('Helvetica', 10), bd=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(notes_frame, command=text_widget.yview); text_widget.config(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y"); text_widget.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        def get_selections_and_generate():
+            selected_plots = {key: var.get() for key, var in self.report_vars.items()}
+            expert_notes = text_widget.get("1.0", "end-1c")
+            self._generate_pdf_report(expert_notes, selected_plots); top.destroy()
+        ttk.Button(top, text="Salva Report in PDF", command=get_selections_and_generate, style="Accent.TButton").pack(pady=10, ipady=5)
 
-    # Sezione Analisi Chat (Sinistra)
-    chat_frame = ttk.LabelFrame(main_frame, text=" Analisi Chat ", padding=(10,5))
-    chat_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-    
-    ttk.Button(chat_frame, text="Chat più attive", command=plot_active_chats).pack(fill="x", pady=3)
-    ttk.Button(chat_frame, text="Ultime chat attive", command=show_recent_chats).pack(fill="x", pady=3)
-    ttk.Button(chat_frame, text="Messaggi cancellati", command=show_deleted_messages).pack(fill="x", pady=3)
-    ttk.Button(chat_frame, text="Chat effimere attive", command=show_ephemeral_chats).pack(fill="x", pady=3)
-    
-    # Sezione Analisi Testuale (Sinistra - Inferiore)
-    text_frame = ttk.LabelFrame(main_frame, text=" Analisi Testuale ", padding=(10,5))
-    text_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-    
-    ttk.Button(text_frame, text="Parole più usate", command=plot_word_histogram).pack(fill="x", pady=3)
-    ttk.Button(text_frame, text="Parole più usate (4+ lettere)", command=plot_word_histogram_min_4).pack(fill="x", pady=3)
-    ttk.Button(text_frame, text="Genera WordCloud (4+ lettere)", command=plot_wordcloud).pack(fill="x", pady=3)
-    ttk.Button(text_frame, text="Analisi Sentiment", command=plot_sentiment).pack(fill="x", pady=3)
+    def _generate_pdf_report(self, expert_notes, selected_plots):
+        filepath = asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Documents", "*.pdf")], title="Salva Report come PDF")
+        if not filepath: return
+        self.status_bar.config(text="Generazione Report PDF in corso..."); self.root.update_idletasks()
+        try:
+            doc = SimpleDocTemplate(filepath, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+            styles = getSampleStyleSheet(); story = []
+            story.append(Paragraph("Report di Analisi Forense WhatsApp", styles['h1']))
+            story.append(Paragraph(f"File Analizzato: {os.path.basename(self.db_path)}", styles['Normal']))
+            story.append(Paragraph(f"Data Report: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+            story.append(Spacer(1, 1*cm))
+            stats = self.db_manager.get_summary_stats()
+            story.append(Paragraph("Statistiche Riassuntive", styles['h2']))
+            story.append(Paragraph(f" •  <b>Numero Totale di Chat:</b> {stats['total_chats']}", styles['Normal']))
+            story.append(Paragraph(f" •  <b>Numero Totale di Messaggi:</b> {stats['total_messages']}", styles['Normal']))
+            story.append(Paragraph(f" •  <b>Periodo di Attività:</b> Dal {self._format_timestamp(stats['start_date'])} al {self._format_timestamp(stats['end_date'])}", styles['Normal']))
+            story.append(Spacer(1, 1*cm))
+            story.append(Paragraph("Top 5 Chat più Attive", styles['h2']))
+            active_chats_data = [['Chat/Utente', 'Numero Messaggi']] + self.db_manager.get_active_chats(limit=5)
+            tbl = Table(active_chats_data, colWidths=[10*cm, 4*cm])
+            tbl.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#075E54")), ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12), ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)]))
+            story.append(tbl)
+            
+            plot_generators = {
+                "active_chats": self._generate_active_chats_plot_for_pdf, "heatmap": self._generate_heatmap_plot_for_pdf,
+                "wordcloud": self._generate_wordcloud_plot_for_pdf, "media_types": self._generate_media_analysis_plot_for_pdf,
+                "timeline": self._generate_timeline_plot_for_pdf, "sentiment": self._generate_sentiment_plot_for_pdf,
+            }
 
-    # Sezione Ricerche (Destra - Superiore)
-    search_frame = ttk.LabelFrame(main_frame, text=" Ricerche ", padding=(10,5))
-    search_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-    
-    Label(search_frame, text="Cerca messaggi per parola:").pack(anchor="w")
-    search_entry = ttk.Entry(search_frame)
-    search_entry.pack(fill="x", pady=3)
-    ttk.Button(search_frame, text="Avvia ricerca testuale", command=lambda: show_search_results(search_entry.get())).pack(fill="x", pady=3)
-    
-    Label(search_frame, text="Ricerca per numero:").pack(anchor="w", pady=(10,0))
-    number_entry = ttk.Entry(search_frame)
-    number_entry.pack(fill="x", pady=3)
+            if any(selected_plots.values()):
+                story.append(PageBreak()); story.append(Paragraph("Analisi Grafiche", styles['h2']))
+                for key, is_selected in selected_plots.items():
+                    if is_selected and key in plot_generators:
+                        plot_image = plot_generators[key]()
+                        if plot_image:
+                            story.append(plot_image); story.append(Spacer(1, 0.5*cm))
+            if expert_notes.strip():
+                story.append(PageBreak()); story.append(Paragraph("Considerazioni del Consulente Tecnico", styles['h2']))
+                story.append(Paragraph(expert_notes.replace('\n', '<br/>'), styles['Normal']))
 
-    ttk.Button(search_frame, text="Visualizza posizioni condivise", command=lambda: show_location_map(number_entry.get())).pack(fill="x", pady=3)
-    ttk.Button(search_frame, text="Avvia ricerca messaggi cancellati", command=lambda: show_search_deleted(number_entry.get())).pack(fill="x", pady=3)
-    ttk.Button(search_frame, text="Avvia ricerca messaggi onetime", command=lambda: show_search_onetime(number_entry.get())).pack(fill="x", pady=3)
-
-    Label(search_frame, text="Ricerca ultimi 100 messaggi per numero / nome gruppo:").pack(anchor="w", pady=(10,0))
-    number_group_entry = ttk.Entry(search_frame)
-    number_group_entry.pack(fill="x", pady=3)
-    ttk.Button(search_frame, text="Visualizza ultimi messaggi", command=lambda: show_latest_messages(number_group_entry.get())).pack(fill="x", pady=3)
-
-    # Sezione Analisi Avanzata (Destra - Inferiore)
-    advanced_frame = ttk.LabelFrame(main_frame, text=" Analisi Avanzata ", padding=(10,5))
-    advanced_frame.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
-    
-    ttk.Button(advanced_frame, text="Analisi Media", command=plot_media_analysis).pack(fill="x", pady=3)
-    ttk.Button(advanced_frame, text="Timeline Messaggi", command=plot_timeline).pack(fill="x", pady=3)
-    ttk.Button(advanced_frame, text="Mappa Calore Interazioni", command=plot_heatmap).pack(fill="x", pady=2)
-
-    # Padding a tutti i widget
-    for child in main_frame.winfo_children():
-        child.grid_configure(padx=5, pady=5)
-    
-    root.mainloop()
+            doc.build(story)
+            messagebox.showinfo("Successo", f"Report PDF salvato con successo in:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Errore Report", f"Impossibile generare il report PDF:\n{e}")
+        finally:
+            self.status_bar.config(text="Pronto."); plt.close('all')
 
 if __name__ == "__main__":
-    create_gui()
+    root = Tk()
+    app = WhatsAppForensicsApp(root)
+    root.mainloop()
